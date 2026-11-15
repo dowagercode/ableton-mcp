@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -57,6 +57,10 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
+    "main_and_return_tracks",
+    "get_track_mixer",
+    "set_track_mixer",
+    "delete_device",
 ]
 
 def create_instance(c_instance):
@@ -501,6 +505,36 @@ class AbletonMCP(ControlSurface):
                 except queue.Empty:
                     response["status"] = "error"
                     response["message"] = "Timeout waiting for operation to complete"
+            elif command_type in ("set_track_mixer", "delete_device"):
+                response_queue = queue.Queue()
+
+                def main_thread_task():
+                    try:
+                        if command_type == "set_track_mixer":
+                            result = self._set_track_mixer(params.get("track_index", 0), params.get("volume_db"), params.get("pan"))
+                        else:
+                            result = self._delete_device(params.get("track_index", 0), params.get("device_index", 0), params.get("name"))
+                        response_queue.put({"status": "success", "result": result})
+                    except Exception as e:
+                        self.log_message("Error in " + command_type + ": " + str(e))
+                        response_queue.put({"status": "error", "message": str(e)})
+
+                try:
+                    self.schedule_message(0, main_thread_task)
+                except AssertionError:
+                    main_thread_task()
+                try:
+                    task_response = response_queue.get(timeout=10.0)
+                    if task_response.get("status") == "error":
+                        response["status"] = "error"
+                        response["message"] = task_response.get("message", "Unknown error")
+                    else:
+                        response["result"] = task_response.get("result", {})
+                except queue.Empty:
+                    response["status"] = "error"
+                    response["message"] = "Timeout waiting for operation to complete"
+            elif command_type == "get_track_mixer":
+                response["result"] = self._mixer_state(self._track_at(params.get("track_index", 0)))
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -562,17 +596,35 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting session info: " + str(e))
             raise
     
+    def _track_at(self, track_index):
+        """The track a command means. 0 and up are the ordinary tracks, as before.
+        -1 is the Main track; -2 is the first return track (A), -3 the second (B), and so on."""
+        if track_index >= 0:
+            if track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            return self._song.tracks[track_index]
+        if track_index == -1:
+            return self._song.master_track
+        returns = self._song.return_tracks
+        if -track_index - 2 >= len(returns):
+            raise IndexError("Return track index out of range")
+        return returns[-track_index - 2]
+
+    def _track_state(self, track, name, default=None):
+        """Read a property that some kinds of track do not have (the Main track has no mute, solo or clip slots)."""
+        try:
+            return getattr(track, name)
+        except (AttributeError, RuntimeError):
+            return default
+
     def _get_track_info(self, track_index):
         """Get information about a track"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
+            track = self._track_at(track_index)
             
             # Get clip slots
             clip_slots = []
-            for slot_index, slot in enumerate(track.clip_slots):
+            for slot_index, slot in enumerate(self._track_state(track, "clip_slots", []) if track_index >= 0 else []):
                 clip_info = None
                 if slot.has_clip:
                     clip = slot.clip
@@ -602,10 +654,10 @@ class AbletonMCP(ControlSurface):
             result = {
                 "index": track_index,
                 "name": track.name,
-                "is_audio_track": track.has_audio_input,
-                "is_midi_track": track.has_midi_input,
-                "mute": track.mute,
-                "solo": track.solo,
+                "is_audio_track": self._track_state(track, "has_audio_input", False),
+                "is_midi_track": self._track_state(track, "has_midi_input", False),
+                "mute": self._track_state(track, "mute", False),
+                "solo": self._track_state(track, "solo", False),
                 "arm": self._safe_arm(track),
                 "volume": track.mixer_device.volume.value,
                 "panning": track.mixer_device.panning.value,
@@ -676,14 +728,64 @@ class AbletonMCP(ControlSurface):
             raise
 
 
+    @staticmethod
+    def _db_of(param, value):
+        """A fader position (0 to 1) as dB, by the words Live itself shows for it."""
+        try:
+            return float(str(param.str_for_value(value)).split()[0])
+        except (ValueError, IndexError):
+            return float("-inf")
+
+    def _mixer_state(self, track):
+        vol, pan = track.mixer_device.volume, track.mixer_device.panning
+        db = self._db_of(vol, vol.value)
+        return {"name": track.name, "volume": float(vol.value), "volume_db": db if db != float("-inf") else None,
+                "volume_text": str(vol.str_for_value(vol.value)), "pan": float(pan.value)}
+
+    def _set_track_mixer(self, track_index, volume_db=None, pan=None):
+        """Set a track's fader (in dB) and/or pan (-1 left to 1 right). Works on Main and returns too."""
+        track = self._track_at(track_index)
+        before = self._mixer_state(track)
+        vol = track.mixer_device.volume
+        if volume_db is not None:
+            lo, hi = float(vol.min), float(vol.max)
+            if float(volume_db) >= self._db_of(vol, hi):
+                lo = hi
+            else:
+                for _ in range(40):  # the fader's scale is not a formula we know: home in on the position that reads as this many dB
+                    mid = (lo + hi) / 2.0
+                    if self._db_of(vol, mid) < float(volume_db):
+                        lo = mid
+                    else:
+                        hi = mid
+            # (four decimals lands on the round positions Live itself uses, so 0 dB reads "0.0 dB" and not "-0.001 dB")
+            v = round((lo + hi) / 2.0, 4)
+            if v < hi and self._db_of(vol, v) < float(volume_db):
+                # rounding fell just below the edge (-20 would read "-20.1 dB"): take the next step up, which is past it
+                v = int(hi * 10000 + 0.9999) / 10000.0
+            vol.value = max(float(vol.min), min(float(vol.max), v))
+        if pan is not None:
+            p = track.mixer_device.panning
+            p.value = max(float(p.min), min(float(p.max), float(pan)))
+        return {"track_index": track_index, "before": before, "after": self._mixer_state(track)}
+
+    def _delete_device(self, track_index, device_index, name=None):
+        """Take a device off a track. If `name` is given the device there must have that name, so a
+        changed device order cannot make this remove the wrong thing."""
+        track = self._track_at(track_index)
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range")
+        found = track.devices[device_index].name
+        if name is not None and found != name:
+            raise ValueError("Device {0} on that track is '{1}', not '{2}'".format(device_index, found, name))
+        track.delete_device(device_index)
+        return {"deleted": found, "devices": [d.name for d in track.devices]}
+
     def _set_track_name(self, track_index, name):
         """Set the name of a track"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
             # Set the name
-            track = self._song.tracks[track_index]
+            track = self._track_at(track_index)
             track.name = name
             
             result = {
@@ -1293,10 +1395,7 @@ class AbletonMCP(ControlSurface):
     def _load_browser_item(self, track_index, item_uri):
         """Load a browser item onto a track by its URI"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
+            track = self._track_at(track_index)
             
             # Access the application's browser instance instead of creating a new one
             app = self.application()
@@ -2200,9 +2299,7 @@ class AbletonMCP(ControlSurface):
 
     def _get_device_parameters(self, track_index, device_index):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
+            track = self._track_at(track_index)
             if device_index < 0 or device_index >= len(track.devices):
                 raise IndexError("Device index out of range")
             device = track.devices[device_index]
@@ -2292,9 +2389,7 @@ class AbletonMCP(ControlSurface):
 
     def _set_device_parameter(self, track_index, device_index, parameter_index, value):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
+            track = self._track_at(track_index)
             if device_index < 0 or device_index >= len(track.devices):
                 raise IndexError("Device index out of range")
             device = track.devices[device_index]

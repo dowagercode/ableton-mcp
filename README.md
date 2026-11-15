@@ -249,6 +249,8 @@ Once the config file has been set on Claude, and the remote script is running in
 - Create, edit, and trigger clips
 - Control playback
 - Load instruments and effects from Ableton's browser
+- Set track faders (in dB) and pans, and remove devices from a track
+- Work on the Main and return tracks as well as ordinary ones (track index -1 is Main, -2 return A, -3 return B ...)
 - Add notes to MIDI clips
 - Change tempo and other session parameters
 

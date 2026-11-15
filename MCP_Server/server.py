@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
 from .telemetry import record_startup
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
@@ -462,7 +462,7 @@ def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str
     Get detailed information about a specific track in Ableton.
 
     Parameters:
-    - track_index: The index of the track to get information about
+    - track_index: The index of the track to get information about (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -523,7 +523,7 @@ def get_device_parameters(
     Read all parameters for a device on a track (name, value, min, max).
 
     Parameters:
-    - track_index: Track that owns the device
+    - track_index: Track that owns the device (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
     - device_index: Index into the track's device chain
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
@@ -556,7 +556,7 @@ def set_device_parameter(
     Use get_device_parameters first to discover parameter indices and ranges.
 
     Parameters:
-    - track_index: Track that owns the device
+    - track_index: Track that owns the device (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
     - device_index: Index into the track's device chain
     - parameter_index: Index into device.parameters
     - value: New parameter value (Live parameter units)
@@ -580,6 +580,117 @@ def set_device_parameter(
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_track_mixer")
+@trajectory_tool("get_track_mixer")
+def get_track_mixer(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Read a track's fader and pan: the fader's position (0 to 1), its level in dB,
+    the text Live shows for it, and the pan (-1 left to 1 right).
+
+    Parameters:
+    - track_index: The track (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_track_mixer")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_mixer", {"track_index": track_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting track mixer: {str(e)}")
+        return f"Error getting track mixer: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_track_mixer")
+@trajectory_tool("set_track_mixer")
+def set_track_mixer(
+    ctx: Context,
+    track_index: int,
+    volume_db: Optional[float] = None,
+    pan: Optional[float] = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a track's fader in dB and/or its pan. Give either or both.
+
+    The fader is set by the level Live itself shows, so volume_db=-6 leaves the
+    fader reading "-6.0 dB". Values beyond the fader's range are held at its ends.
+
+    Parameters:
+    - track_index: The track (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
+    - volume_db: The fader level in dB (Live's faders reach +6 dB)
+    - pan: -1 (left) to 1 (right), 0 for the centre
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_track_mixer")
+        if missing:
+            return missing
+        if volume_db is None and pan is None:
+            return "Nothing to set: give volume_db, pan, or both"
+        params: Dict[str, Any] = {"track_index": track_index}
+        if volume_db is not None:
+            params["volume_db"] = volume_db
+        if pan is not None:
+            params["pan"] = pan
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_mixer", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting track mixer: {str(e)}")
+        return f"Error setting track mixer: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("delete_device")
+@trajectory_tool("delete_device")
+def delete_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    device_name: str,
+    user_prompt: str = "",
+) -> str:
+    """
+    Remove a device from a track's device chain.
+
+    device_name must match the name of the device at device_index (as
+    get_track_info or get_device_parameters report it); if it does not, nothing
+    is removed. This keeps a stale index, after the chain has changed, from
+    removing the wrong device.
+
+    Parameters:
+    - track_index: The track (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
+    - device_index: Index into the track's device chain
+    - device_name: The name of the device expected at that index
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("delete_device")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_device", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "name": device_name,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting device: {str(e)}")
+        return f"Error deleting device: {str(e)}"
 
 
 @mcp.tool()
@@ -674,7 +785,7 @@ def set_track_name(ctx: Context, track_index: int, name: str, user_prompt: str =
     Set the name of a track.
 
     Parameters:
-    - track_index: The index of the track to rename
+    - track_index: The index of the track to rename (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
     - name: The new name for the track
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
@@ -894,7 +1005,7 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_pro
     Load an instrument or effect onto a track using its URI.
 
     Parameters:
-    - track_index: The index of the track to load the instrument on
+    - track_index: The index of the track to load the instrument on (0 and up for ordinary tracks, -1 for the Main track, -2 for return A, -3 for return B, and so on)
     - uri: The URI of the instrument or effect to load (e.g., 'query:Synths#Instrument%20Rack:Bass:FileId_5116')
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
